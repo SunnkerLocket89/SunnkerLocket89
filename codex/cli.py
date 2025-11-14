@@ -89,13 +89,22 @@ class CodexCLI:
             action="store_true",
             help="Overwrite an existing configuration file if present.",
         )
+        login_parser.add_argument(
+            "--config-path",
+            type=str,
+            help=(
+                "Write the API key to a custom configuration file instead of the "
+                "default location."
+            ),
+        )
 
     def run(self, argv: Optional[list[str]] = None) -> str:
         """Parse *argv* and dispatch to the appropriate sub-command."""
         args = self.parser.parse_args(argv)
 
         if args.command == "login":
-            command = LoginCommand()
+            config_path = Path(args.config_path).expanduser() if args.config_path else None
+            command = LoginCommand(writer=APIKeyWriter(config_path))
             return command.run(with_api_key=args.with_api_key, overwrite=args.overwrite)
 
         raise CLIError(f"Unknown command: {args.command}")
