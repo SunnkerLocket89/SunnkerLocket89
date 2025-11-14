@@ -56,3 +56,31 @@ re-downloading files.
 
 Run `python run_idaho4_parser.py --help` to see the full list of supported
 flags.
+
+## Codex CLI (API key management)
+
+This repository also includes a small command-line helper for managing Codex
+API credentials: `codex/cli.py`. The `codex` console script exposes a
+`login` subcommand which stores an API key in a local configuration file.
+
+Examples:
+
+- Save an API key to the default config location (read key from STDIN):
+
+  ```bash
+  echo "MY_API_KEY" | codex login --with-api-key
+  ```
+
+- Save an API key to a custom configuration file:
+
+  ```bash
+  echo "MY_API_KEY" | codex login --with-api-key --config-path ~/.config/codex/custom.json
+  ```
+
+Options for `codex login`:
+
+- `--with-api-key` – Read the API key from STDIN (required when providing the key via a pipe or redirect).
+- `--overwrite` – Overwrite an existing configuration file if present.
+- `--config-path` – Write the API key to a custom configuration file instead of the default location (`~/.config/codex/config.json`).
+
+The CLI prints a success message with the location of the saved configuration on success.
