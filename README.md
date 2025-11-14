@@ -1,16 +1,58 @@
-## Hi there 👋
+# Idaho4 Exhibits Parser
 
-<!--
-**SunnkerLocket89/SunnkerLocket89** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+This repository provides a command line helper that automates the task of
+downloading and organising the public exhibits listed in the
+`Idaho4_exhibits_with_full_metadata.xlsx` spreadsheet.  The script reads the
+spreadsheet, downloads the referenced PDF files, and optionally extracts the
+first *N* pages of each document into a dedicated folder.
 
-Here are some ideas to get you started:
+## Installation
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+The parser now works out of the box using only the Python standard library.
+Optional third-party packages improve performance and unlock extras:
+
+- [`openpyxl`](https://openpyxl.readthedocs.io/) – faster workbook loading.
+- [`requests`](https://requests.readthedocs.io/) – robust HTTP downloads.
+- [`tqdm`](https://tqdm.github.io/) – rich progress bars.
+- [`PyMuPDF`](https://pymupdf.readthedocs.io/) or [`PyPDF2`](https://pypdf2.readthedocs.io/) – PDF page extraction.
+
+Install them individually or via the provided `requirements.txt` file when
+available:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Usage
+
+```bash
+python run_idaho4_parser.py \
+  --in-file Idaho4_exhibits_with_full_metadata.xlsx \
+  --sheet Exhibits_With_Metadata \
+  --workers 6 \
+  --extract-pages 4
+```
+
+By default the script stores the downloaded PDFs in `idaho4_output/downloads`
+and writes a JSON manifest plus a CSV summary to `idaho4_output`.  Downloaded
+files are prefixed with the zero-padded Excel row number to guarantee
+unique filenames while keeping the on-disk order aligned with the worksheet.
+The manifest records whether each row succeeded, was skipped (for example
+because it did not contain a URL), or failed, and includes the corresponding
+Excel row number for quick cross-referencing.  Re-run the command with
+`--resume` to continue from where a previous session stopped without
+re-downloading files.
+
+### Common flags
+
+- `--url-column` – Set the spreadsheet column that contains the PDF URL.  When
+  omitted the script attempts to infer a sensible column automatically.
+- `--id-column` – Configure the column that uniquely identifies each exhibit.
+  This identifier is used to name the downloaded files.
+- `--out-dir` – Choose a different destination directory for all generated
+  artefacts.
+- `--manifest` / `--csv` – Override the default manifest output paths.
+- `--verbose` – Enable verbose logging for troubleshooting.
+
+Run `python run_idaho4_parser.py --help` to see the full list of supported
+flags.
