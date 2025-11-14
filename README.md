@@ -8,18 +8,20 @@ first *N* pages of each document into a dedicated folder.
 
 ## Installation
 
-Install the required third-party libraries in your Python environment before
-running the parser.  The script now reads the workbook directly via
-[`openpyxl`](https://openpyxl.readthedocs.io/) so no `pandas` dependency is
-needed.  You can install the libraries individually or via the provided
-`requirements.txt` file:
+The parser now works out of the box using only the Python standard library.
+Optional third-party packages improve performance and unlock extras:
+
+- [`openpyxl`](https://openpyxl.readthedocs.io/) – faster workbook loading.
+- [`requests`](https://requests.readthedocs.io/) – robust HTTP downloads.
+- [`tqdm`](https://tqdm.github.io/) – rich progress bars.
+- [`PyMuPDF`](https://pymupdf.readthedocs.io/) or [`PyPDF2`](https://pypdf2.readthedocs.io/) – PDF page extraction.
+
+Install them individually or via the provided `requirements.txt` file when
+available:
 
 ```bash
 pip install -r requirements.txt
 ```
-
-The above is equivalent to running `pip install requests openpyxl PyMuPDF
-PyPDF2 tqdm`.
 
 ## Usage
 

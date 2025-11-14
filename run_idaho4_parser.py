@@ -30,23 +30,45 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from xml.etree import ElementTree
+from zipfile import ZipFile
 
-try:  # ``requests`` handles the HTTP downloads.
+try:  # ``requests`` handles the HTTP downloads when available.
     import requests
     from requests import Response
-except ImportError as exc:  # pragma: no cover - import-time validation
-    raise SystemExit("The 'requests' package is required to run this script.") from exc
+except Exception:  # pragma: no cover - optional dependency
+    requests = None  # type: ignore[assignment]
+    Response = object  # type: ignore[assignment]
 
 try:  # ``tqdm`` is used to render progress bars while processing rows.
     from tqdm import tqdm
-except ImportError as exc:  # pragma: no cover - import-time validation
-    raise SystemExit("The 'tqdm' package is required to run this script.") from exc
+except Exception:  # pragma: no cover - optional dependency
 
-try:  # ``openpyxl`` is used to read the input workbook.
+    def tqdm(iterable: Iterable[Any], *args: Any, **kwargs: Any) -> Iterator[Any]:
+        """Lightweight stand-in for :func:`tqdm.tqdm` when the package is missing."""
+
+        total = kwargs.get("total")
+        desc = kwargs.get("desc", "")
+        count = 0
+        for item in iterable:
+            count += 1
+            if total:
+                message = f"\r{desc}: {count}/{total}"
+                sys.stderr.write(message)
+                sys.stderr.flush()
+            yield item
+        if total:
+            sys.stderr.write("\n")
+        return
+
+
+try:  # ``openpyxl`` is used to read the input workbook when installed.
     from openpyxl import load_workbook
-except ImportError as exc:  # pragma: no cover - import-time validation
-    raise SystemExit("The 'openpyxl' package is required to run this script.") from exc
+except Exception:  # pragma: no cover - optional dependency
+    load_workbook = None  # type: ignore[assignment]
 
 try:  # PyMuPDF is the preferred backend for page extraction.
     import fitz  # type: ignore[attr-defined]
@@ -193,6 +215,244 @@ def _normalise_column_name(value: Any, index: int) -> str:
     return str(value).strip() or f"column_{index + 1}"
 
 
+def _strip_namespace(tag: str) -> str:
+    """Remove the XML namespace from *tag* if present."""
+
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def _column_index_from_ref(ref: str) -> int:
+    """Return the zero-based column index extracted from an Excel cell ref."""
+
+    letters = []
+    for char in ref:
+        if char.isalpha():
+            letters.append(char.upper())
+        else:
+            break
+    index = 0
+    for char in letters:
+        index = index * 26 + (ord(char) - ord("A") + 1)
+    return index - 1
+
+
+def _read_shared_strings(zf: ZipFile) -> List[str]:
+    """Return the workbook shared strings table."""
+
+    try:
+        data = zf.read("xl/sharedStrings.xml")
+    except KeyError:
+        return []
+
+    root = ElementTree.fromstring(data)
+    strings: List[str] = []
+    for element in root:
+        if _strip_namespace(element.tag) != "si":
+            continue
+        fragments: List[str] = []
+        for text_node in element.iter():
+            if _strip_namespace(text_node.tag) == "t" and text_node.text is not None:
+                fragments.append(text_node.text)
+        strings.append("".join(fragments))
+    return strings
+
+
+def _resolve_sheet_targets(zf: ZipFile) -> List[Tuple[str, str]]:
+    """Return a mapping of sheet name to XML path within the archive."""
+
+    try:
+        workbook_data = zf.read("xl/workbook.xml")
+        rels_data = zf.read("xl/_rels/workbook.xml.rels")
+    except KeyError as error:
+        raise ValueError("The workbook is missing required metadata") from error
+
+    root = ElementTree.fromstring(workbook_data)
+    namespace = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
+    sheets: List[Tuple[str, str]] = []
+    rel_namespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+    rels_root = ElementTree.fromstring(rels_data)
+    relationships = {
+        rel.attrib["Id"]: rel.attrib["Target"]
+        for rel in rels_root
+        if _strip_namespace(rel.tag) == "Relationship"
+    }
+
+    sheet_tag = f"{{{namespace}}}sheet" if namespace else "sheet"
+    rel_key = f"{{{rel_namespace}}}id"
+    for sheet in root.findall(f".//{sheet_tag}"):
+        name = sheet.attrib.get("name", "")
+        rel_id = sheet.attrib.get(rel_key)
+        if not rel_id:
+            continue
+        target = relationships.get(rel_id)
+        if not target:
+            continue
+        if target.startswith("../"):
+            target = target.replace("../", "", 1)
+        if target.startswith("/"):
+            target = target.lstrip("/")
+        elif not target.startswith("xl/"):
+            target = f"xl/{target}"
+        sheets.append((name, target))
+    return sheets
+
+
+def _parse_cell_value(cell: ElementTree.Element, shared_strings: Sequence[str], namespace: str) -> Any:
+    """Return the Python value stored in *cell*."""
+
+    cell_type = cell.attrib.get("t")
+    value_element = cell.find(f"{{{namespace}}}v") if namespace else cell.find("v")
+
+    if cell_type == "s":
+        if value_element is None or value_element.text is None:
+            return None
+        try:
+            index = int(value_element.text)
+        except ValueError:
+            return None
+        return shared_strings[index] if 0 <= index < len(shared_strings) else None
+
+    if cell_type == "inlineStr":
+        inline = cell.find(f"{{{namespace}}}is") if namespace else cell.find("is")
+        if inline is None:
+            inline = cell
+        fragments: List[str] = []
+        for node in inline.iter():
+            if _strip_namespace(node.tag) == "t" and node.text is not None:
+                fragments.append(node.text)
+        return "".join(fragments)
+
+    if cell_type == "b":
+        if value_element is None or value_element.text is None:
+            return None
+        return value_element.text == "1"
+
+    if cell_type == "str":
+        if value_element is None:
+            return ""
+        return value_element.text or ""
+
+    if value_element is None or value_element.text is None:
+        return None
+
+    text = value_element.text.strip()
+    if not text:
+        return None
+
+    try:
+        if any(character in text for character in (".", "e", "E")):
+            number = float(text)
+            if number.is_integer():
+                return int(number)
+            return number
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _iter_xlsx_rows(zf: ZipFile, sheet_path: str, shared_strings: Sequence[str]) -> Iterator[Tuple[int, Dict[int, Any]]]:
+    """Yield row number and cell mapping for *sheet_path* inside *zf*."""
+
+    try:
+        data = zf.read(sheet_path)
+    except KeyError as error:
+        raise ValueError(f"Worksheet data '{sheet_path}' is missing from the workbook") from error
+    root = ElementTree.fromstring(data)
+    namespace = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
+    sheet_data = root.find(f"{{{namespace}}}sheetData") if namespace else root.find("sheetData")
+    if sheet_data is None:
+        return iter(())
+
+    def row_iterator() -> Iterator[Tuple[int, Dict[int, Any]]]:
+        for row in sheet_data:
+            if _strip_namespace(row.tag) != "row":
+                continue
+            try:
+                row_number = int(row.attrib.get("r", "0"))
+            except ValueError:
+                row_number = 0
+            last_index = -1
+            cells: Dict[int, Any] = {}
+            for cell in row:
+                if _strip_namespace(cell.tag) != "c":
+                    continue
+                ref = cell.attrib.get("r")
+                if ref:
+                    column_index = _column_index_from_ref(ref)
+                else:
+                    column_index = last_index + 1
+                last_index = column_index
+                cells[column_index] = _parse_cell_value(cell, shared_strings, namespace)
+            yield row_number or 0, cells
+
+    return row_iterator()
+
+
+def _read_workbook_via_builtin(path: Path, sheet: Optional[str]) -> WorkbookData:
+    """Fallback Excel reader that only relies on the Python standard library."""
+
+    with ZipFile(path) as zf:
+        sheet_targets = _resolve_sheet_targets(zf)
+        if not sheet_targets:
+            raise ValueError("The workbook does not contain any worksheets")
+
+        if sheet is None:
+            _, sheet_path = sheet_targets[0]
+        else:
+            sheet_path = None
+            for name, candidate in sheet_targets:
+                if name == sheet or name.lower() == sheet.lower():
+                    sheet_path = candidate
+                    break
+            if sheet_path is None:
+                raise ValueError(f"Worksheet '{sheet}' not found in workbook")
+
+        shared_strings = _read_shared_strings(zf)
+        rows = list(_iter_xlsx_rows(zf, sheet_path, shared_strings))
+
+    if not rows:
+        raise ValueError("The worksheet does not contain any rows")
+
+    header_row_number, header_cells = rows[0]
+    if not header_cells:
+        raise ValueError("The worksheet does not contain a header row")
+
+    max_header_index = max(header_cells)
+    columns = [
+        _normalise_column_name(header_cells.get(index), index)
+        for index in range(max_header_index + 1)
+    ]
+
+    records: List[Dict[str, Any]] = []
+    row_numbers: List[int] = []
+    for row_number, cells in rows[1:]:
+        if cells:
+            max_index = max(cells)
+            if max_index >= len(columns):
+                for index in range(len(columns), max_index + 1):
+                    column_name = _normalise_column_name(None, index)
+                    columns.append(column_name)
+                    for record in records:
+                        record[column_name] = None
+        values = [cells.get(index) for index in range(len(columns))]
+        if all(value is None for value in values):
+            continue
+        record = {columns[index]: values[index] for index in range(len(columns))}
+        records.append(record)
+        if row_number:
+            resolved_row_number = row_number
+        elif row_numbers:
+            resolved_row_number = row_numbers[-1] + 1
+        else:
+            resolved_row_number = (header_row_number or 1) + len(records)
+        row_numbers.append(resolved_row_number)
+
+    return WorkbookData(columns=columns, records=records, row_numbers=row_numbers)
+
+
 def read_input_workbook(path: Path, sheet: Optional[str]) -> WorkbookData:
     """Load *path* and return its header columns and row dictionaries."""
 
@@ -201,16 +461,21 @@ def read_input_workbook(path: Path, sheet: Optional[str]) -> WorkbookData:
 
     LOGGER.debug("Loading workbook %s", path)
 
+    if load_workbook is None:
+        return _read_workbook_via_builtin(path, sheet)
+
     workbook = load_workbook(path, data_only=True, read_only=True)
     try:
         worksheet = workbook[sheet] if sheet else workbook.active
     except KeyError as error:
+        workbook.close()
         raise ValueError(f"Worksheet '{sheet}' not found in workbook") from error
 
     rows = worksheet.iter_rows(values_only=True)
     try:
         header = next(rows)
     except StopIteration as error:
+        workbook.close()
         raise ValueError("The worksheet does not contain any rows") from error
 
     columns = [_normalise_column_name(value, index) for index, value in enumerate(header)]
@@ -250,13 +515,29 @@ def download_pdf(url: str, destination: Path, *, resume: bool, timeout: int, chu
 
     LOGGER.debug("Downloading %s -> %s", url, destination)
 
-    response: Response = requests.get(url, stream=True, timeout=timeout)
-    response.raise_for_status()
+    if requests is not None:
+        response: Response = requests.get(url, stream=True, timeout=timeout)
+        response.raise_for_status()
 
-    with destination.open("wb") as handle:
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            if chunk:
+        with destination.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    handle.write(chunk)
+        return True
+
+    request = Request(url, headers={"User-Agent": "Python-urllib/3"})
+    try:
+        with urlopen(request, timeout=timeout) as source, destination.open("wb") as handle:
+            while True:
+                chunk = source.read(chunk_size)
+                if not chunk:
+                    break
                 handle.write(chunk)
+    except HTTPError as error:  # pragma: no cover - network interaction
+        raise RuntimeError(f"HTTP error {error.code}: {error.reason}") from error
+    except URLError as error:  # pragma: no cover - network interaction
+        raise RuntimeError(f"Failed to download file: {error.reason}") from error
+
     return True
 
 
