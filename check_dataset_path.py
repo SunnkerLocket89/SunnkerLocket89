@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Iterable
 
 
 SANDBOX_PREFIX = "sandbox:"
@@ -72,6 +73,61 @@ def _suggest_missing_path_hints(path: Path) -> list[str]:
     return hints
 
 
+def _suggest_alternative_locations(path: Path, *, limit: int = 3) -> list[str]:
+    """Return hints for similarly named files found in common search roots."""
+
+    name = path.name
+    if not name:
+        return []
+
+    search_roots: list[Path] = []
+
+    def _append_if_exists(candidate: Path) -> None:
+        try:
+            if candidate.exists() and candidate not in search_roots:
+                search_roots.append(candidate)
+        except OSError:
+            pass
+
+    _append_if_exists(Path.cwd())
+    _append_if_exists(Path.home())
+    _append_if_exists(Path("/workspace"))
+
+    hints: list[str] = []
+    seen: set[Path] = set()
+
+    for root in search_roots:
+        matches = _iter_matches(root, name, limit=limit - len(hints))
+        for match in matches:
+            if match in seen:
+                continue
+            seen.add(match)
+            hints.append(f"Hint: Found '{name}' at '{match}'.")
+            if len(hints) >= limit:
+                return hints
+
+    return hints
+
+
+def _iter_matches(root: Path, name: str, *, limit: int) -> Iterable[Path]:
+    """Yield up to ``limit`` matches for ``name`` within ``root``."""
+
+    if limit <= 0:
+        return []
+
+    found: list[Path] = []
+
+    try:
+        for candidate in root.rglob(name):
+            found.append(candidate)
+            if len(found) >= limit:
+                break
+    except OSError:
+        return []
+
+    return found
+
+
 def _first_missing_parent(path: Path) -> Path | None:
     """Return the first missing parent directory for ``path`` if any."""
 
@@ -104,6 +160,9 @@ def main(path_str: str) -> None:
         print("Hint: Provide an absolute path, e.g. /mnt/data/file.xlsx")
 
     for hint in _suggest_missing_path_hints(path):
+        print(hint)
+
+    for hint in _suggest_alternative_locations(path):
         print(hint)
 
 
